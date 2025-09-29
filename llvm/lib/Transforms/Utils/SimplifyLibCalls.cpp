@@ -23,6 +23,7 @@
 #include "llvm/Analysis/Utils/Local.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/AttributeMask.h"
+#include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -36,6 +37,7 @@
 #include "llvm/Support/KnownFPClass.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/SizeOpts.h"
@@ -83,6 +85,34 @@ struct HotColdHintParser : public cl::parser<unsigned> {
     return false;
   }
 };
+
+bool constantSizeMemcmpCanBeSimplified(CallInst *CI, Value *LHS, Value *RHS, uint64_t Size, const DataLayout &DL) {
+  if (Size == 0 || Size == 1) {
+    return true;
+  }
+
+  if (DL.isLegalInteger(Size * 8) && isOnlyUsedInZeroEqualityComparison(CI)) {
+    IntegerType *IntType = IntegerType::get(CI->getContext(), Size * 8);
+    Align PrefAlignment = DL.getPrefTypeAlign(IntType);
+
+    // First, see if we can fold either argument to a constant.
+    Value *LHSV = nullptr;
+    if (auto *LHSC = dyn_cast<Constant>(LHS))
+      LHSV = ConstantFoldLoadFromConstPtr(LHSC, IntType, DL);
+
+    Value *RHSV = nullptr;
+    if (auto *RHSC = dyn_cast<Constant>(RHS))
+      RHSV = ConstantFoldLoadFromConstPtr(RHSC, IntType, DL);
+
+    // Don't generate unaligned loads. If either source is constant data,
+    // alignment doesn't matter for that source because there is no load.
+    if ((LHSV || getKnownAlignment(LHS, DL, CI) >= PrefAlignment) &&
+        (RHSV || getKnownAlignment(RHS, DL, CI) >= PrefAlignment)) {
+      return true;
+    }
+
+    return false;
+}
 
 } // end anonymous namespace
 
@@ -1580,7 +1610,13 @@ static Value *optimizeMemCmpConstantSize(CallInst *CI, Value *LHS, Value *RHS,
         RHSV = B.CreateLoad(IntType, RHS, "rhsv");
       return B.CreateZExt(B.CreateICmpNE(LHSV, RHSV), CI->getType(), "memcmp");
     }
+
+    llvm::errs() << "optimizeMemCmpConstantSize: bad alignment\n";
   }
+
+  llvm::errs() << "optimizeMemCmpConstantSize: illegal int or not-onlyUsedInZero...\n";
+  llvm::errs() << DL.isLegalInteger(Len * 8) << "\n";
+  llvm::errs() << *CI << "\n";
 
   return nullptr;
 }
@@ -1598,10 +1634,41 @@ Value *LibCallSimplifier::optimizeMemCmpBCmpCommon(CallInst *CI,
 
   // Handle constant Size.
   ConstantInt *LenC = dyn_cast<ConstantInt>(Size);
-  if (!LenC)
+  if (LenC)
+    return optimizeMemCmpConstantSize(CI, LHS, RHS, LenC->getZExtValue(), B, DL);
+
+  // Handle constant range.
+  SimplifyQuery SQ(DL, TLI, DT, AC, CI, true, true, DC);
+  ConstantRange SizeRange = computeConstantRangeIncludingKnownBits(Size, false, SQ);
+  
+  // When <= 2 possible values for {mem,b}cmp size, generate separate constant-size calls for each value                      
+  if (SizeRange.isSizeLargerThan(2))
     return nullptr;
 
-  return optimizeMemCmpConstantSize(CI, LHS, RHS, LenC->getZExtValue(), B, DL);
+  uint64_t SizeLower = SizeRange.getLower().getLimitedValue();
+  uint64_t SizeUpper = SizeRange.getUpper().getLimitedValue() - 1;
+  
+  B.SetInsertPoint(CI);
+  Value *SizeIsLowerCond = B.CreateICmpEQ(Size, ConstantInt::get(Size->getType(), SizeLower));
+
+  BasicBlock *LowValueBlock = nullptr;
+  BasicBlock *HighValueBlock = nullptr;
+  llvm::SplitBlockAndInsertIfThenElse(SizeIsLowerCond, CI, &LowValueBlock, &HighValueBlock);
+
+  B.SetInsertPoint(LowValueBlock->getFirstInsertionPt());
+  CallInst *LowValueCmp = B.CreateCall(CI->getCalledFunction(), {LHS, RHS, ConstantInt::get(Size->getType(), SizeLower)});
+  
+  B.SetInsertPoint(HighValueBlock->getFirstInsertionPt());
+  CallInst *HighValueCmp = B.CreateCall(CI->getCalledFunction(), {LHS, RHS, ConstantInt::get(Size->getType(), SizeUpper)});
+
+  B.SetInsertPoint(CI->getParent()->getFirstInsertionPt());
+  PHINode *Phi = B.CreatePHI(CI->getType(), 2);
+  Phi->addIncoming(LowValueCmp, LowValueBlock);
+  Phi->addIncoming(HighValueCmp, HighValueBlock);
+ 
+  llvm::errs() << *CI->getParent()->getParent();
+
+  return Phi;
 }
 
 Value *LibCallSimplifier::optimizeMemCmp(CallInst *CI, IRBuilderBase &B) {

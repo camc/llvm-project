@@ -256,8 +256,18 @@ bool llvm::isOnlyUsedInZeroComparison(const Instruction *I) {
 
 bool llvm::isOnlyUsedInZeroEqualityComparison(const Instruction *I) {
   return !I->user_empty() && all_of(I->users(), [](const User *U) {
+    // Direct usage.
     CmpPredicate P;
-    return match(U, m_ICmp(P, m_Value(), m_Zero())) && ICmpInst::isEquality(P);
+    if (match(U, m_ICmp(P, m_Value(), m_Zero())) && ICmpInst::isEquality(P)) {
+      return true;
+    }
+
+    // Usage through a PHI.
+    if (auto *PN = dyn_cast<PHINode>(U)) {
+      return isOnlyUsedInZeroEqualityComparison(PN);
+    }
+
+    return false;
   });
 }
 
@@ -5063,11 +5073,6 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,
                      KnownRHS.isKnownNeverPosZero()) &&
                     (KnownLHS.isKnownNeverPosZero() ||
                      KnownRHS.isKnownNeverNegZero()))) {
-          // Don't take sign bit from NaN operands.
-          if (!KnownLHS.isKnownNeverNaN())
-            KnownLHS.SignBit = std::nullopt;
-          if (!KnownRHS.isKnownNeverNaN())
-            KnownRHS.SignBit = std::nullopt;
           if ((IID == Intrinsic::maximum || IID == Intrinsic::maximumnum ||
                IID == Intrinsic::maxnum) &&
               (KnownLHS.SignBit == false || KnownRHS.SignBit == false))

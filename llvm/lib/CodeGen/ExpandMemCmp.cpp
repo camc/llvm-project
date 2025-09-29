@@ -831,6 +831,9 @@ static bool expandMemCmp(CallInst *CI, const TargetTransformInfo *TTI,
                          const TargetLowering *TLI, const DataLayout *DL,
                          ProfileSummaryInfo *PSI, BlockFrequencyInfo *BFI,
                          DomTreeUpdater *DTU, const bool IsBCmp) {
+  llvm::errs() << "expandMemCmp: " << *CI << "\n";
+
+
   NumMemCmpCalls++;
 
   // Early exit from expansion if -Oz.
